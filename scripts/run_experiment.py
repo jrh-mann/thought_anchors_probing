@@ -13,7 +13,8 @@ import gc
 import torch
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# scripts/ is a sibling of src/, so we need parent.parent here.
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 try:
     from tqdm import tqdm
