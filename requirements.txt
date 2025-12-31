@@ -1,0 +1,27 @@
+# Core ML frameworks
+torch>=2.1.0
+numpy>=1.24.0
+
+# LLM inference
+vllm>=0.4.0
+
+# Model loading and tokenization
+transformers>=4.36.0
+
+# Activation extraction / neural network probing
+nnsight>=0.2.0
+
+# HTTP client for vLLM API (optional - for api_client.py)
+requests>=2.28.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Scientific computing (sparse matrices in load.py)
+scipy>=1.10.0
+
+# HuggingFace datasets (for negative samples extraction)
+datasets>=2.14.0
+
+scikit-learn
+matplotlib

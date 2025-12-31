@@ -1,0 +1,15 @@
+{
+  "n_samples": 37291,
+  "n_layers": 24,
+  "d_model": 2880,
+  "n_train": 28135,
+  "n_test": 9156,
+  "best_linear_layer": 16,
+  "best_linear_test_mse": 0.05518385699938447,
+  "best_linear_test_r2": 0.6384538617526503,
+  "random_ablation": {
+    "real_mean_r2": 0.5107798537127693,
+    "random_mean_r2": -0.27753682208651176,
+    "difference": 0.7883166757992811
+  }
+}
