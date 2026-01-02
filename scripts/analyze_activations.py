@@ -44,12 +44,105 @@ quick_load = _load_module.quick_load
 BASE_DIR = "/workspace/activations"
 OUTPUT_DIR = "plots"
 RESULTS_DIR = "results"
-MLP_HIDDEN_SIZES = [2, 3, 4, 8, 16, 32]
+MLP_HIDDEN_SIZES = [2]
 TEST_RATIO = 0.2
-MLP_EPOCHS = 500  # Fewer epochs with early stopping
-MLP_LR = 0.01     # Higher LR with scheduler
+VAL_RATIO = 0.1
+MLP_EPOCHS = 100  # Fewer epochs with early stopping
+MLP_LR = 0.001     # Higher LR with scheduler
 MLP_BATCH_SIZE = 1024
 RANDOM_SEED = 42
+
+# Regularization defaults (can be overridden via CLI args)
+RIDGE_ALPHA = 1.0
+MLP_WEIGHT_DECAY = 1e-4
+MLP_DROPOUT = 0.0
+
+# ============================================================================
+# METRICS HELPERS
+# ============================================================================
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """
+    Compute standard regression metrics plus a diagnostic R² on non-zero labels.
+    
+    Why include a non-zero diagnostic?
+    If the label distribution is heavily zero-inflated (e.g., many sentences have
+    p_reward_hacks == 0), overall R² can be dominated by the model learning to
+    predict ~0 everywhere. The non-zero R² is not "more correct", but it is a
+    useful sanity check for whether we're learning signal beyond the mass at 0.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    
+    mse = float(mean_squared_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    
+    # Diagnostic: R² computed only on non-zero labels
+    mask_nz = y_true > 0.0
+    if mask_nz.any():
+        r2_nz = float(r2_score(y_true[mask_nz], y_pred[mask_nz]))
+    else:
+        r2_nz = float("nan")
+    
+    return {"mse": mse, "r2": r2, "r2_nonzero": r2_nz}
+
+
+def standardize_train_test(
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    eps: float = 1e-8
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Standardize inputs using TRAIN statistics only.
+    
+    Returns:
+        X_train_s, X_test_s, mean, std
+    """
+    mean = X_train.mean(axis=0, keepdims=True)
+    std = X_train.std(axis=0, keepdims=True) + eps
+    return (X_train - mean) / std, (X_test - mean) / std, mean, std
+
+
+def save_mlp_2layer_artifact(
+    out_path: Path,
+    *,
+    layer_idx: int,
+    hidden_size: int,
+    mean: np.ndarray,
+    std: np.ndarray,
+    model_state_dict: Dict[str, torch.Tensor],
+    ridge_alpha: float,
+    mlp_weight_decay: float,
+    mlp_dropout: float,
+    huber_beta: float,
+    notes: str = ""
+) -> None:
+    """
+    Save a production-friendly artifact for the *2-layer* probe as-is, plus its
+    standardization stats.
+    
+    In production:
+      x_s = (x - mean) / std
+      y_hat = MLPProbe(...).load_state_dict(model_state_dict)(x_s)
+    
+    Saved format is a torch checkpoint for easy loading.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt = {
+        "layer_idx": int(layer_idx),
+        "hidden_size": int(hidden_size),
+        "mean": mean.reshape(-1).astype(np.float32),
+        "std": std.reshape(-1).astype(np.float32),
+        "model_state_dict": {k: v.detach().cpu() for k, v in model_state_dict.items()},
+        "train_hparams": {
+            "ridge_alpha": float(ridge_alpha),
+            "mlp_weight_decay": float(mlp_weight_decay),
+            "mlp_dropout": float(mlp_dropout),
+            "huber_beta": float(huber_beta),
+        },
+        "notes": notes,
+    }
+    torch.save(ckpt, out_path)
 
 # ============================================================================
 # DATA LOADING AND PREPROCESSING
@@ -117,6 +210,18 @@ def get_prompt_type(prompt_name: str) -> str:
     return prompt_name
 
 
+def is_negative_prompt(prompt_type: str) -> bool:
+    """
+    Identify negative-sample prompts produced by scripts/extract_negative_activations.py.
+    
+    These are created under directory names like 'negative_0', 'negative_1', ...
+    We generally do NOT want these to appear in the test split, because they are
+    distributionally different from the counterfactual rollouts and can make
+    evaluation artificially easy via dataset-ID shortcuts.
+    """
+    return prompt_type.startswith("negative_")
+
+
 def split_by_prompt(
     X: np.ndarray,
     y: np.ndarray,
@@ -136,15 +241,26 @@ def split_by_prompt(
     prompt_types = list(set(get_prompt_type(p) for p in prompt_names))
     prompt_types.sort()
     
-    # Shuffle and split prompt types
-    np.random.shuffle(prompt_types)
-    n_test = max(1, int(len(prompt_types) * test_ratio))
-    test_types = set(prompt_types[:n_test])
-    train_types = set(prompt_types[n_test:])
+    # Ensure negative samples never end up in the test split
+    negative_types = sorted([pt for pt in prompt_types if is_negative_prompt(pt)])
+    non_negative_types = sorted([pt for pt in prompt_types if not is_negative_prompt(pt)])
+    
+    # Shuffle and split *non-negative* prompt types
+    np.random.shuffle(non_negative_types)
+    if len(non_negative_types) == 0:
+        # Degenerate case: only negative prompts exist. We'll keep everything in train.
+        test_types = set()
+        train_types = set(prompt_types)
+    else:
+        n_test = max(1, int(len(non_negative_types) * test_ratio))
+        test_types = set(non_negative_types[:n_test])
+        train_types = set(non_negative_types[n_test:]) | set(negative_types)
     
     print(f"\nPrompt type split:")
     print(f"  Train types ({len(train_types)}): {sorted(train_types)}")
     print(f"  Test types ({len(test_types)}): {sorted(test_types)}")
+    if negative_types:
+        print(f"  Negative-only train types ({len(negative_types)}): {negative_types}")
     
     # Create masks
     train_mask = np.array([get_prompt_type(p) in train_types for p in prompt_names])
@@ -163,6 +279,72 @@ def split_by_prompt(
     print(f"  Test: {len(X_test)} samples")
     
     return X_train, y_train, X_test, y_test, train_prompts, test_prompts
+
+
+def split_by_prompt_train_val_test(
+    X: np.ndarray,
+    y: np.ndarray,
+    prompt_names: List[str],
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    random_seed: int = 42
+) -> Tuple[
+    np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray,
+    List[str], List[str], List[str]
+]:
+    """
+    3-way split by prompt type:
+    - negative_* are forced into TRAIN only
+    - remaining prompt types split into TRAIN/VAL/TEST
+    """
+    rng = np.random.RandomState(random_seed)
+    
+    prompt_types = sorted(set(get_prompt_type(p) for p in prompt_names))
+    negative_types = sorted([pt for pt in prompt_types if is_negative_prompt(pt)])
+    non_negative_types = sorted([pt for pt in prompt_types if not is_negative_prompt(pt)])
+    
+    rng.shuffle(non_negative_types)
+    n = len(non_negative_types)
+    
+    if n == 0:
+        train_types, val_types, test_types = set(prompt_types), set(), set()
+    else:
+        n_test = max(1, int(round(n * test_ratio)))
+        n_val = max(1, int(round(n * val_ratio))) if n >= 3 else 0
+        test_types = set(non_negative_types[:n_test])
+        val_types = set(non_negative_types[n_test:n_test + n_val])
+        train_types = set(non_negative_types[n_test + n_val:]) | set(negative_types)
+        if not train_types:
+            train_types = set(val_types)
+            val_types = set()
+    
+    print(f"\nPrompt type split (3-way):")
+    print(f"  Train types ({len(train_types)}): {sorted(train_types)}")
+    print(f"  Val types   ({len(val_types)}): {sorted(val_types)}")
+    print(f"  Test types  ({len(test_types)}): {sorted(test_types)}")
+    if negative_types:
+        print(f"  Negative-only train types ({len(negative_types)}): {negative_types}")
+    
+    train_mask = np.array([get_prompt_type(p) in train_types for p in prompt_names])
+    val_mask = np.array([get_prompt_type(p) in val_types for p in prompt_names])
+    test_mask = np.array([get_prompt_type(p) in test_types for p in prompt_names])
+    
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_val, y_val = X[val_mask], y[val_mask]
+    X_test, y_test = X[test_mask], y[test_mask]
+    
+    train_prompts = [p for p, m in zip(prompt_names, train_mask) if m]
+    val_prompts = [p for p, m in zip(prompt_names, val_mask) if m]
+    test_prompts = [p for p, m in zip(prompt_names, test_mask) if m]
+    
+    print(f"\nSplit sizes:")
+    print(f"  Train: {len(X_train)} samples")
+    print(f"  Val:   {len(X_val)} samples")
+    print(f"  Test:  {len(X_test)} samples")
+    
+    return X_train, y_train, X_val, y_val, X_test, y_test, train_prompts, val_prompts, test_prompts
 
 
 # ============================================================================
@@ -208,6 +390,8 @@ def train_linear_probe(
         'test_mse': float(mean_squared_error(y_test, y_test_pred)),
         'train_r2': float(r2_score(y_train, y_train_pred)),
         'test_r2': float(r2_score(y_test, y_test_pred)),
+        'train_r2_nonzero': compute_metrics(y_train, y_train_pred)['r2_nonzero'],
+        'test_r2_nonzero': compute_metrics(y_test, y_test_pred)['r2_nonzero'],
         'y_test_pred': y_test_pred,
         'y_test_true': y_test
     }
@@ -218,11 +402,19 @@ def train_linear_probe(
 # ============================================================================
 
 class MLPProbe(nn.Module):
-    """Simple MLP: d_model -> hidden_size -> 1 with proper initialization"""
+    """
+    "MLP" probe.
     
-    def __init__(self, input_dim: int, hidden_size: int):
+    NOTE: By user request, this probe is *linear* (no nonlinearity). With two
+    Linear layers and no activation, the entire network is equivalent to a
+    single Linear layer (with bias). We keep the hidden layer structure only
+    so you can vary hidden_size and keep the surrounding code unchanged.
+    """
+    
+    def __init__(self, input_dim: int, hidden_size: int, dropout: float = 0.0):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_size)
+        self.dropout = nn.Dropout(p=float(dropout)) if dropout and dropout > 0.0 else nn.Identity()
         self.fc2 = nn.Linear(hidden_size, 1)
         
         # Xavier initialization for better gradient flow
@@ -232,13 +424,17 @@ class MLPProbe(nn.Module):
         nn.init.zeros_(self.fc2.bias)
     
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
+        # Intentionally linear: no activation.
+        x = self.fc1(x)
+        x = self.dropout(x)
         return self.fc2(x).squeeze(-1)
 
 
 def train_mlp_probe(
     X_train: np.ndarray,
     y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     X_test: np.ndarray,
     y_test: np.ndarray,
     hidden_size: int,
@@ -246,7 +442,12 @@ def train_mlp_probe(
     lr: float = 0.01,
     batch_size: int = 1024,
     patience: int = 50,
-    verbose: bool = False
+    weight_decay: float = 1e-4,
+    dropout: float = 0.0,
+    huber_beta: float = 1.0,
+    log_every: int = 10,
+    verbose: bool = True,
+    print_prefix: str = ""
 ) -> Dict[str, float]:
     """
     Train MLP probe with mini-batch SGD, early stopping, and LR scheduling.
@@ -260,28 +461,26 @@ def train_mlp_probe(
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # Standardize inputs (crucial for MLP training stability)
-    X_mean = X_train.mean(axis=0, keepdims=True)
-    X_std = X_train.std(axis=0, keepdims=True) + 1e-8
-    X_train_norm = (X_train - X_mean) / X_std
-    X_test_norm = (X_test - X_mean) / X_std
+    # Standardize inputs using TRAIN statistics (production requires saving these).
+    X_train_s, X_val_s, X_mean, X_std = standardize_train_test(X_train, X_val)
+    X_test_s = (X_test - X_mean) / X_std
     
-    # Convert to tensors
-    X_train_t = torch.tensor(X_train_norm, dtype=torch.float32, device=device)
+    X_train_t = torch.tensor(X_train_s, dtype=torch.float32, device=device)
     y_train_t = torch.tensor(y_train, dtype=torch.float32, device=device)
-    X_test_t = torch.tensor(X_test_norm, dtype=torch.float32, device=device)
+    X_val_t = torch.tensor(X_val_s, dtype=torch.float32, device=device)
+    X_test_t = torch.tensor(X_test_s, dtype=torch.float32, device=device)
     
     # Create dataset and dataloader for mini-batch training
     dataset = torch.utils.data.TensorDataset(X_train_t, y_train_t)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     # Create model
-    model = MLPProbe(X_train.shape[1], hidden_size).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    model = MLPProbe(X_train.shape[1], hidden_size, dropout=dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=20, min_lr=1e-5
     )
-    criterion = nn.MSELoss()
+    criterion = nn.SmoothL1Loss(beta=huber_beta)
     
     # Early stopping
     best_loss = float('inf')
@@ -289,8 +488,8 @@ def train_mlp_probe(
     patience_counter = 0
     
     # Training loop
-    model.train()
     for epoch in range(epochs):
+        model.train()
         epoch_loss = 0.0
         for X_batch, y_batch in dataloader:
             optimizer.zero_grad()
@@ -301,22 +500,40 @@ def train_mlp_probe(
             epoch_loss += loss.item() * len(X_batch)
         
         epoch_loss /= len(X_train_t)
-        scheduler.step(epoch_loss)
+        
+        # Evaluate on VAL (for scheduling + early stopping)
+        model.eval()
+        with torch.no_grad():
+            y_val_t = torch.tensor(y_val, dtype=torch.float32, device=device)
+            val_loss = float(criterion(model(X_val_t), y_val_t).item())
+        
+        scheduler.step(val_loss)
+        
+        # Optional diagnostic: evaluate on TEST to spot overtraining (do not early-stop on it)
+        test_loss = None
+        with torch.no_grad():
+            y_test_t = torch.tensor(y_test, dtype=torch.float32, device=device)
+            test_loss = float(criterion(model(X_test_t), y_test_t).item())
+        
+        # Progress logging
+        if log_every is not None and log_every > 0:
+            if epoch == 0 or (epoch + 1) % log_every == 0:
+                if test_loss is None:
+                    print(f"{print_prefix}Epoch {epoch+1:4d}/{epochs} | train_loss={epoch_loss:.6f} | val_loss={val_loss:.6f} | lr={optimizer.param_groups[0]['lr']:.6f}")
+                else:
+                    print(f"{print_prefix}Epoch {epoch+1:4d}/{epochs} | train_loss={epoch_loss:.6f} | val_loss={val_loss:.6f} | test_loss={test_loss:.6f} | lr={optimizer.param_groups[0]['lr']:.6f}")
         
         # Early stopping check
-        if epoch_loss < best_loss - 1e-6:
-            best_loss = epoch_loss
+        if val_loss < best_loss - 1e-6:
+            best_loss = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 if verbose:
-                    print(f"      Early stop at epoch {epoch+1}")
+                    print(f"{print_prefix}Early stop at epoch {epoch+1} (no val loss improvement for {patience} epochs)")
                 break
-        
-        if verbose and (epoch + 1) % 100 == 0:
-            print(f"      Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.6f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
     
     # Load best model
     if best_state is not None:
@@ -326,13 +543,22 @@ def train_mlp_probe(
     model.eval()
     with torch.no_grad():
         y_train_pred = model(X_train_t).cpu().numpy()
+        y_val_pred = model(X_val_t).cpu().numpy()
         y_test_pred = model(X_test_t).cpu().numpy()
     
     return {
         'train_mse': float(mean_squared_error(y_train, y_train_pred)),
-        'test_mse': float(mean_squared_error(y_test, y_test_pred)),
         'train_r2': float(r2_score(y_train, y_train_pred)),
+        'train_r2_nonzero': compute_metrics(y_train, y_train_pred)['r2_nonzero'],
+        'val_mse': float(mean_squared_error(y_val, y_val_pred)),
+        'val_r2': float(r2_score(y_val, y_val_pred)),
+        'val_r2_nonzero': compute_metrics(y_val, y_val_pred)['r2_nonzero'],
+        'test_mse': float(mean_squared_error(y_test, y_test_pred)),
         'test_r2': float(r2_score(y_test, y_test_pred)),
+        'test_r2_nonzero': compute_metrics(y_test, y_test_pred)['r2_nonzero'],
+        'input_mean': X_mean.reshape(-1),
+        'input_std': X_std.reshape(-1),
+        'model_state_dict': {k: v.detach().cpu() for k, v in model.state_dict().items()},
         'y_test_pred': y_test_pred,
         'y_test_true': y_test
     }
@@ -591,8 +817,17 @@ def main():
     parser.add_argument("--base-dir", type=str, default=BASE_DIR, help="Activations directory")
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="Output directory for plots")
     parser.add_argument("--results-dir", type=str, default=RESULTS_DIR, help="Output directory for metrics")
-    parser.add_argument("--test-ratio", type=float, default=TEST_RATIO, help="Test set ratio")
+    parser.add_argument("--test-ratio", type=float, default=0.1, help="Test set ratio (default: 0.1)")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation set ratio (default: 0.1)")
     parser.add_argument("--mlp-epochs", type=int, default=MLP_EPOCHS, help="MLP training epochs")
+    parser.add_argument("--ridge-alpha", type=float, default=RIDGE_ALPHA, help="Ridge (linear probe) L2 regularization strength")
+    parser.add_argument("--mlp-weight-decay", type=float, default=MLP_WEIGHT_DECAY, help="MLP AdamW weight decay (L2 regularization)")
+    parser.add_argument("--mlp-dropout", type=float, default=MLP_DROPOUT, help="MLP dropout probability (0 disables)")
+    parser.add_argument("--huber-beta", type=float, default=1.0, help="Huber beta for SmoothL1Loss (default: 1.0)")
+    parser.add_argument("--save-probe-artifacts", action="store_true", default=True,
+                       help="Save production-ready probe artifacts (default: True)")
+    parser.add_argument("--no-save-probe-artifacts", action="store_true",
+                       help="Disable saving probe artifacts")
     parser.add_argument("--skip-mlp", action="store_true", help="Skip MLP training (faster)")
     parser.add_argument("--skip-pca", action="store_true", help="Skip PCA visualization")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit samples for testing (before token expansion)")
@@ -628,8 +863,8 @@ def main():
     print("SPLITTING DATA")
     print("=" * 60)
     
-    X_train, y_train, X_test, y_test, train_prompts, test_prompts = split_by_prompt(
-        X, y, prompt_names, test_ratio=args.test_ratio, random_seed=RANDOM_SEED
+    X_train, y_train, X_val, y_val, X_test, y_test, train_prompts, val_prompts, test_prompts = split_by_prompt_train_val_test(
+        X, y, prompt_names, val_ratio=args.val_ratio, test_ratio=args.test_ratio, random_seed=RANDOM_SEED
     )
     
     # ========================================================================
@@ -647,15 +882,18 @@ def main():
         X_train_layer = X_train[:, layer_idx, :]
         X_test_layer = X_test[:, layer_idx, :]
         
-        results = train_linear_probe(X_train_layer, y_train, X_test_layer, y_test)
+        results = train_linear_probe(X_train_layer, y_train, X_test_layer, y_test, alpha=args.ridge_alpha)
         linear_results[layer_idx] = results
         
         if results['test_mse'] < best_test_mse_linear:
             best_test_mse_linear = results['test_mse']
             best_layer_linear = layer_idx
         
-        print(f"  Layer {layer_idx:2d}: Train MSE={results['train_mse']:.4f}, "
-              f"Test MSE={results['test_mse']:.4f}, Test R²={results['test_r2']:.4f}")
+        print(
+            f"  Layer {layer_idx:2d}: "
+            f"Train MSE={results['train_mse']:.4f}, Train R²={results['train_r2']:.4f} (nz={results['train_r2_nonzero']:.4f}); "
+            f"Test MSE={results['test_mse']:.4f}, Test R²={results['test_r2']:.4f} (nz={results['test_r2_nonzero']:.4f})"
+        )
     
     print(f"\n  Best layer: {best_layer_linear} (Test MSE={best_test_mse_linear:.4f})")
     
@@ -674,8 +912,14 @@ def main():
         X_train_layer = X_train[:, layer_idx, :]
         X_test_layer = X_test[:, layer_idx, :]
         
-        results = train_linear_probe(X_train_layer, y_train_random, X_test_layer, y_test_random)
+        results = train_linear_probe(X_train_layer, y_train_random, X_test_layer, y_test_random, alpha=args.ridge_alpha)
         random_results[layer_idx] = results
+        
+        print(
+            f"  [random] Layer {layer_idx:2d}: "
+            f"Train MSE={results['train_mse']:.4f}, Train R²={results['train_r2']:.4f} (nz={results['train_r2_nonzero']:.4f}); "
+            f"Test MSE={results['test_mse']:.4f}, Test R²={results['test_r2']:.4f} (nz={results['test_r2_nonzero']:.4f})"
+        )
     
     # Compare
     real_mean_r2 = np.mean([linear_results[l]['test_r2'] for l in test_layer_indices])
@@ -697,23 +941,51 @@ def main():
         
         for layer_idx in test_layer_indices:
             X_train_layer = X_train[:, layer_idx, :]
+            X_val_layer = X_val[:, layer_idx, :]
             X_test_layer = X_test[:, layer_idx, :]
             
             print(f"\n  Layer {layer_idx}:")
             
             for hidden_size in MLP_HIDDEN_SIZES:
                 results = train_mlp_probe(
-                    X_train_layer, y_train, X_test_layer, y_test,
+                    X_train_layer, y_train, X_val_layer, y_val, X_test_layer, y_test,
                     hidden_size=hidden_size,
                     epochs=args.mlp_epochs,
                     lr=MLP_LR,
                     batch_size=MLP_BATCH_SIZE,
-                    verbose=False
+                    weight_decay=args.mlp_weight_decay,
+                    dropout=args.mlp_dropout,
+                    huber_beta=args.huber_beta,
+                    log_every=10,
+                    verbose=True,
+                    print_prefix="      "
                 )
                 mlp_results[layer_idx][hidden_size] = results
                 
-                print(f"    h={hidden_size:2d}: Train MSE={results['train_mse']:.4f}, "
-                      f"Test MSE={results['test_mse']:.4f}, Test R²={results['test_r2']:.4f}")
+                print(
+                    f"    h={hidden_size:2d}: "
+                    f"Train MSE={results['train_mse']:.4f}, Train R²={results['train_r2']:.4f} (nz={results['train_r2_nonzero']:.4f}); "
+                    f"Val MSE={results['val_mse']:.4f}, Val R²={results['val_r2']:.4f} (nz={results['val_r2_nonzero']:.4f}); "
+                    f"Test MSE={results['test_mse']:.4f}, Test R²={results['test_r2']:.4f} (nz={results['test_r2_nonzero']:.4f})"
+                )
+                
+                # Save a production-friendly artifact (2-layer net + standardization)
+                save_artifacts = args.save_probe_artifacts and not args.no_save_probe_artifacts
+                if save_artifacts:
+                    out_path = Path(args.results_dir) / "probe_artifacts" / f"mlp_linear_layer_{layer_idx}_h{hidden_size}.pt"
+                    save_mlp_2layer_artifact(
+                        out_path,
+                        layer_idx=layer_idx,
+                        hidden_size=hidden_size,
+                        mean=results["input_mean"],
+                        std=results["input_std"],
+                        model_state_dict=results["model_state_dict"],
+                        ridge_alpha=args.ridge_alpha,
+                        mlp_weight_decay=args.mlp_weight_decay,
+                        mlp_dropout=args.mlp_dropout,
+                        huber_beta=args.huber_beta,
+                        notes="Standardized 2-layer linear (no activation) probe saved as-is.",
+                    )
     
     # ========================================================================
     # 6. PCA Visualization
@@ -763,16 +1035,16 @@ def main():
             output_path=str(Path(args.output_dir) / "mlp_hidden_size_comparison.png")
         )
         
-        # Pred vs actual for best MLP
+        # Pred vs actual for best MLP (selected by VAL, reported on TEST)
         best_mlp_layer = None
         best_mlp_h = None
-        best_mlp_mse = float('inf')
+        best_mlp_val_mse = float('inf')
         
         for layer_idx in mlp_results:
             for h in mlp_results[layer_idx]:
-                mse = mlp_results[layer_idx][h]['test_mse']
-                if mse < best_mlp_mse:
-                    best_mlp_mse = mse
+                mse = mlp_results[layer_idx][h]['val_mse']
+                if mse < best_mlp_val_mse:
+                    best_mlp_val_mse = mse
                     best_mlp_layer = layer_idx
                     best_mlp_h = h
         
@@ -784,6 +1056,23 @@ def main():
                 title=f"MLP Probe (h={best_mlp_h}) - Layer {best_mlp_layer}",
                 output_path=str(Path(args.output_dir) / "pred_vs_actual_mlp_best.png")
             )
+            # Also save a canonical "best" artifact name for production convenience
+            save_artifacts = args.save_probe_artifacts and not args.no_save_probe_artifacts
+            if save_artifacts:
+                out_path = Path(args.results_dir) / "probe_artifacts" / "mlp_linear_best.pt"
+                save_mlp_2layer_artifact(
+                    out_path,
+                    layer_idx=int(best_mlp_layer),
+                    hidden_size=int(best_mlp_h),
+                    mean=best_mlp_results["input_mean"],
+                    std=best_mlp_results["input_std"],
+                    model_state_dict=best_mlp_results["model_state_dict"],
+                    ridge_alpha=args.ridge_alpha,
+                    mlp_weight_decay=args.mlp_weight_decay,
+                    mlp_dropout=args.mlp_dropout,
+                    huber_beta=args.huber_beta,
+                    notes="Best standardized 2-layer probe selected by VAL MSE (test used only for reporting).",
+                )
     
     # ========================================================================
     # 8. Save metrics
@@ -800,6 +1089,8 @@ def main():
                 result[k] = clean_for_json(v)
             elif isinstance(v, np.ndarray):
                 continue  # Skip arrays
+            elif isinstance(v, torch.Tensor):
+                continue  # Skip tensors (e.g., model_state_dict) in JSON outputs
             elif isinstance(v, (np.floating, np.integer)):
                 result[k] = float(v)
             else:
@@ -813,6 +1104,11 @@ def main():
         'd_model': int(d_model),
         'n_train': int(len(y_train)),
         'n_test': int(len(y_test)),
+        'regularization': {
+            'ridge_alpha': float(args.ridge_alpha),
+            'mlp_weight_decay': float(args.mlp_weight_decay),
+            'mlp_dropout': float(args.mlp_dropout),
+        },
         'best_linear_layer': int(best_layer_linear),
         'best_linear_test_mse': float(best_test_mse_linear),
         'best_linear_test_r2': float(linear_results[best_layer_linear]['test_r2']),
